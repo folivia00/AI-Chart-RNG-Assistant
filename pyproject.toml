@@ -1,0 +1,20 @@
+[project]
+name = "ai-chart-rng-assistant"
+version = "0.1.0"
+description = "Streamlit app: historical charts, a random number generator and a tool-calling chat assistant."
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Vladimir K" }]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
