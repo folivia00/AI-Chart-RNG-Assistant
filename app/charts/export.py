@@ -14,6 +14,11 @@ Two kinds of failure are distinguished:
 Kaleido's own per-image timeout (90 s) cannot be changed through `Figure.to_image` and
 does not cover the browser start, so rendering runs in a worker thread and the caller
 stops waiting after `RENDER_TIMEOUT` seconds.
+
+A render that timed out keeps running in the background until Kaleido gives up, so
+renders are limited: one at a time per owner (a browser session) and at most
+`MAX_CONCURRENT_RENDERS` in the whole process. A render counts as running until its
+worker thread really ends, abandoned ones included.
 """
 
 from __future__ import annotations
@@ -21,7 +26,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import threading
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from typing import Literal
 
 import plotly.graph_objects as go
@@ -40,6 +45,11 @@ DEFAULT_HEIGHT = 600
 FAILED_MESSAGE = "Rendering the chart image failed. Please try again."
 TIMEOUT_MESSAGE = "Rendering the chart image took too long. Please try again."
 RENDER_TIMEOUT = 30.0  # seconds
+MAX_CONCURRENT_RENDERS = 2
+OWNER_BUSY_MESSAGE = (
+    "A chart image from this session is still rendering. Try again in a few seconds."
+)
+SERVER_BUSY_MESSAGE = "Other chart images are still rendering. Try again in a few seconds."
 
 
 class ExportError(RuntimeError):
@@ -58,9 +68,14 @@ class ExportTimeoutError(ExportFailedError):
     """Rendering did not finish within `RENDER_TIMEOUT` seconds."""
 
 
+class ExportBusyError(ExportFailedError):
+    """A render limit is reached (per owner or process-wide); try again later."""
+
+
 _cache: OrderedDict[tuple[str, str], bytes] = OrderedDict()
 _lock = threading.Lock()
 _unavailable = False
+_running: Counter[str | None] = Counter()  # owner -> renders whose thread is still alive
 
 
 def figure_key(fig: go.Figure) -> str:
@@ -93,11 +108,43 @@ def is_missing_dependency(exc: BaseException) -> bool:
     return False
 
 
-def _render(fig: go.Figure, fmt: ImageFormat) -> bytes:
+def busy_message(owner: str | None = None) -> str | None:
+    """Why a new render cannot start right now, or None if it can."""
+    with _lock:
+        if owner is not None and _running[owner]:
+            return OWNER_BUSY_MESSAGE
+        if _running.total() >= MAX_CONCURRENT_RENDERS:
+            return SERVER_BUSY_MESSAGE
+    return None
+
+
+def renders_in_flight() -> int:
+    """Number of render threads still running, including abandoned ones."""
+    with _lock:
+        return _running.total()
+
+
+def _reserve(owner: str | None) -> None:
+    with _lock:
+        if owner is not None and _running[owner]:
+            raise ExportBusyError(OWNER_BUSY_MESSAGE)
+        if _running.total() >= MAX_CONCURRENT_RENDERS:
+            raise ExportBusyError(SERVER_BUSY_MESSAGE)
+        _running[owner] += 1
+
+
+def _release(owner: str | None) -> None:
+    with _lock:
+        _running[owner] -= 1
+        if _running[owner] <= 0:
+            del _running[owner]
+
+
+def _render(fig: go.Figure, fmt: ImageFormat, owner: str | None) -> bytes:
     """Render with Kaleido in a daemon thread and wait at most `RENDER_TIMEOUT` seconds.
 
     A thread that is still running after the timeout cannot be stopped; it is abandoned
-    and ends on its own when Kaleido returns or fails.
+    and ends on its own when Kaleido returns or fails. Its slot is released only then.
     """
     outcome: dict[str, object] = {}
 
@@ -106,9 +153,16 @@ def _render(fig: go.Figure, fmt: ImageFormat) -> bytes:
             outcome["data"] = fig.to_image(format=fmt, width=DEFAULT_WIDTH, height=DEFAULT_HEIGHT)
         except BaseException as exc:  # handed over to the waiting thread
             outcome["error"] = exc
+        finally:
+            _release(owner)
 
+    _reserve(owner)
     worker = threading.Thread(target=work, name="chart-export", daemon=True)
-    worker.start()
+    try:
+        worker.start()
+    except BaseException:
+        _release(owner)
+        raise
     worker.join(RENDER_TIMEOUT)
     if worker.is_alive():
         raise ExportTimeoutError(TIMEOUT_MESSAGE)
@@ -122,12 +176,15 @@ def export_unavailable() -> bool:
     return _unavailable
 
 
-def export_figure(fig: go.Figure, fmt: ImageFormat, key: str | None = None) -> bytes:
+def export_figure(
+    fig: go.Figure, fmt: ImageFormat, key: str | None = None, owner: str | None = None
+) -> bytes:
     """Render the figure to PNG or PDF bytes, reusing cached bytes for the same figure.
 
+    `owner` identifies the caller (a browser session) for the one-render-per-owner limit.
     Raises `ExportUnavailableError` if Chrome/Kaleido is missing (remembered), or
-    `ExportFailedError` for any other failure, including `ExportTimeoutError` (not
-    remembered, safe to retry).
+    `ExportFailedError` for any other failure, including `ExportTimeoutError` and
+    `ExportBusyError` (not remembered, safe to retry).
     """
     global _unavailable
     if fmt not in ("png", "pdf"):
@@ -141,9 +198,12 @@ def export_figure(fig: go.Figure, fmt: ImageFormat, key: str | None = None) -> b
         return data
 
     try:
-        data = _render(fig, fmt)
+        data = _render(fig, fmt, owner)
     except ExportTimeoutError:
-        logger.warning("Static export timed out after %.0f s", RENDER_TIMEOUT)
+        logger.warning("Static export timed out after %g s", RENDER_TIMEOUT)
+        raise
+    except ExportBusyError:
+        logger.info("Static export refused: render limit reached")
         raise
     except Exception as exc:  # Kaleido/Chrome failures surface as several exception types
         if is_missing_dependency(exc):
@@ -162,7 +222,10 @@ def export_figure(fig: go.Figure, fmt: ImageFormat, key: str | None = None) -> b
 
 
 def clear_cache() -> None:
-    """Forget cached images and any remembered export failure (used by tests)."""
+    """Forget cached images and any remembered export failure (used by tests).
+
+    Running renders are not touched: their slots are released when their threads end.
+    """
     global _unavailable
     with _lock:
         _cache.clear()

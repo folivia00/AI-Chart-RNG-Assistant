@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from pathlib import Path
 
 import plotly.graph_objects as go
@@ -96,27 +97,45 @@ def test_transient_failure_can_be_retried(monkeypatch: pytest.MonkeyPatch, state
     export.clear_cache()
 
 
-@pytest.fixture
-def hanging_render(monkeypatch: pytest.MonkeyPatch):
-    """Make the first render hang until the test ends, later renders succeed."""
-    release = threading.Event()
-    calls: list[str] = []
+class Hang:
+    """Simulated Kaleido hang: the first `count` renders block until `release()`."""
 
-    def hang_once(self: go.Figure, format: str, **kwargs: object) -> bytes:
-        calls.append(format)
-        if len(calls) == 1:
-            release.wait(10)
+    def __init__(self, count: int = 1) -> None:
+        self.count = count
+        self.calls: list[str] = []
+        self._event = threading.Event()
+
+    def to_image(self, fig: go.Figure, format: str, **kwargs: object) -> bytes:
+        self.calls.append(format)
+        if len(self.calls) <= self.count:
+            self._event.wait(10)
         return f"fake-{format}".encode()
 
-    monkeypatch.setattr(go.Figure, "to_image", hang_once)
+    def release(self) -> None:
+        """Let blocked renders finish and wait until their threads are gone."""
+        self._event.set()
+        deadline = time.monotonic() + 5
+        while export.renders_in_flight() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert export.renders_in_flight() == 0
+
+
+@pytest.fixture
+def hang(monkeypatch: pytest.MonkeyPatch):
+    controller = Hang()
+
+    def to_image(self: go.Figure, format: str, **kwargs: object) -> bytes:
+        return controller.to_image(self, format, **kwargs)
+
+    monkeypatch.setattr(go.Figure, "to_image", to_image)
     monkeypatch.setattr(export, "RENDER_TIMEOUT", 0.2)
     export.clear_cache()
-    yield calls
-    release.set()
+    yield controller
+    controller.release()
     export.clear_cache()
 
 
-def test_hanging_render_times_out(hanging_render: list[str], state) -> None:
+def test_hanging_render_times_out(hang: Hang, state) -> None:
     fig = build_line_chart(state.view(), "date", state.selected_series)
     with pytest.raises(export.ExportTimeoutError) as info:
         export.export_figure(fig, "png")
@@ -124,7 +143,55 @@ def test_hanging_render_times_out(hanging_render: list[str], state) -> None:
     assert isinstance(info.value, export.ExportFailedError)
     assert not export.export_unavailable()
     assert export.export_figure(fig, "png") == b"fake-png"
-    assert hanging_render == ["png", "png"]
+    assert hang.calls == ["png", "png"]
+
+
+def test_one_render_per_owner_until_abandoned_render_ends(hang: Hang, state) -> None:
+    fig = build_line_chart(state.view(), "date", state.selected_series)
+    with pytest.raises(export.ExportTimeoutError):
+        export.export_figure(fig, "png", owner="session-a")
+    # The abandoned render still runs: the same session is refused, another one is not.
+    assert export.renders_in_flight() == 1
+    assert export.busy_message("session-a") == export.OWNER_BUSY_MESSAGE
+    with pytest.raises(export.ExportBusyError) as info:
+        export.export_figure(fig, "pdf", owner="session-a")
+    assert str(info.value) == export.OWNER_BUSY_MESSAGE
+    assert export.busy_message("session-b") is None
+    assert export.export_figure(fig, "pdf", owner="session-b") == b"fake-pdf"
+    assert hang.calls == ["png", "pdf"]
+
+    hang.release()
+    assert export.busy_message("session-a") is None
+    assert export.export_figure(fig, "png", owner="session-a") == b"fake-png"
+
+
+def test_global_cap_on_running_renders(hang: Hang, state) -> None:
+    hang.count = 2
+    fig = build_line_chart(state.view(), "date", state.selected_series)
+    for owner in ("a", "b"):
+        with pytest.raises(export.ExportTimeoutError):
+            export.export_figure(fig, "png", owner=owner)
+    assert export.renders_in_flight() == export.MAX_CONCURRENT_RENDERS == 2
+    assert export.busy_message("c") == export.SERVER_BUSY_MESSAGE
+    with pytest.raises(export.ExportBusyError) as info:
+        export.export_figure(fig, "pdf", owner="c")
+    assert str(info.value) == export.SERVER_BUSY_MESSAGE
+    with pytest.raises(export.ExportBusyError):
+        export.export_figure(fig, "pdf")  # callers without an owner count too
+    assert hang.calls == ["png", "png"]  # refused renders never reach Kaleido
+
+    hang.release()
+    assert export.export_figure(fig, "pdf", owner="c") == b"fake-pdf"
+
+
+def test_cached_image_is_served_while_busy(hang: Hang, state) -> None:
+    hang.count = 0
+    fig = build_line_chart(state.view(), "date", state.selected_series)
+    assert export.export_figure(fig, "png", owner="a") == b"fake-png"
+    hang.count = 2
+    with pytest.raises(export.ExportTimeoutError):
+        export.export_figure(fig, "pdf", owner="a")
+    assert export.export_figure(fig, "png", owner="a") == b"fake-png"
 
 
 def test_missing_dependency_detection() -> None:
@@ -198,16 +265,41 @@ def test_ui_retry_after_transient_failure(monkeypatch: pytest.MonkeyPatch) -> No
     export.clear_cache()
 
 
-def test_ui_retry_after_timeout(hanging_render: list[str]) -> None:
+def test_ui_blocks_export_while_abandoned_render_runs(hang: Hang) -> None:
     at = _load_demo()
 
     _button(at, "Prepare chart (PNG)").click().run()
     assert [e.value for e in at.error] == [export.TIMEOUT_MESSAGE]
+    # The timed-out render is still running: both buttons wait for it.
+    assert _button(at, "Prepare chart (PNG)").disabled
+    assert _button(at, "Prepare chart (PDF)").disabled
+    assert export.OWNER_BUSY_MESSAGE in [c.value for c in at.caption]
+
+    at.run()  # still running: still disabled
+    assert _button(at, "Prepare chart (PNG)").disabled
+
+    hang.release()
+    _button(at, "Check again").click().run()
+    assert not at.error
     assert not _button(at, "Prepare chart (PNG)").disabled
+    assert "Check again" not in [b.label for b in at.button]
 
     _button(at, "Prepare chart (PNG)").click().run()
-    assert not at.error
     assert "Download chart (PNG)" in _download_labels(at)
+    assert hang.calls == ["png", "png"]
+    assert not at.exception
+
+
+def test_ui_disables_export_when_server_is_busy(hang: Hang, state) -> None:
+    hang.count = 2
+    fig = build_line_chart(state.view(), "date", state.selected_series)
+    for owner in ("other-1", "other-2"):
+        with pytest.raises(export.ExportTimeoutError):
+            export.export_figure(fig, "png", owner=owner)
+
+    at = _load_demo()
+    assert _button(at, "Prepare chart (PNG)").disabled
+    assert export.SERVER_BUSY_MESSAGE in [c.value for c in at.caption]
     assert not at.exception
 
 
@@ -223,3 +315,35 @@ def test_ui_disables_export_without_chrome(monkeypatch: pytest.MonkeyPatch) -> N
     assert "Download data (CSV)" in _download_labels(at)
     assert not at.exception
     export.clear_cache()
+
+
+def test_chat_export_follows_axis_toggle_and_session_limit(
+    monkeypatch: pytest.MonkeyPatch, hang: Hang, state
+) -> None:
+    from app.assistant.providers.base import ToolCall
+    from app.assistant.router import execute_tool_call
+
+    figures: list[go.Figure] = []
+    original = go.Figure.to_image
+
+    def capture(self: go.Figure, format: str, **kwargs: object) -> bytes:
+        figures.append(self)
+        return original(self, format, **kwargs)
+
+    monkeypatch.setattr(go.Figure, "to_image", capture)
+    state.dataset.frame["visitors"] = 0.5  # sales median 49.5: about 100x apart
+    state.selected_series = ["sales", "visitors"]
+    state.auto_secondary_axis = False
+
+    result = execute_tool_call(ToolCall("export", {"target": "chart_png"}), state)
+    assert result.error == export.TIMEOUT_MESSAGE  # the first render hangs
+    assert {trace.yaxis for trace in figures[0].data} == {"y"}
+
+    busy = execute_tool_call(ToolCall("export", {"target": "chart_pdf"}), state)
+    assert busy.error == export.OWNER_BUSY_MESSAGE
+    hang.release()
+
+    state.auto_secondary_axis = True
+    done = execute_tool_call(ToolCall("export", {"target": "chart_pdf"}), state)
+    assert done.ok and done.outcome.file.data == b"fake-pdf"
+    assert [trace.yaxis for trace in figures[-1].data] == ["y", "y2"]

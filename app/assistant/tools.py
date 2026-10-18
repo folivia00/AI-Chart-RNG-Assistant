@@ -294,7 +294,7 @@ def run_export(params: ExportParams, state: AppState) -> ToolOutcome:
         secondary_axis=state.auto_secondary_axis,
     )
     try:
-        data = export_figure(fig, fmt)
+        data = export_figure(fig, fmt, owner=state.export_owner)
     except ExportError as exc:
         raise ToolExecutionError(str(exc)) from exc
     mime = "image/png" if fmt == "png" else "application/pdf"

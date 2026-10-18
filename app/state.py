@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
@@ -30,6 +31,8 @@ class AppState:
     numbers: list[int] | list[float] | None = None
     numbers_params: dict[str, Any] | None = None
     revision: int = 0
+    # Identifies this session for the one-image-render-at-a-time limit.
+    export_owner: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     @property
     def has_data(self) -> bool:

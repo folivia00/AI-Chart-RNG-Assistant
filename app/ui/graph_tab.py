@@ -14,6 +14,7 @@ from app.charts.export import (
     ExportError,
     ExportFailedError,
     ImageFormat,
+    busy_message,
     cached_image,
     export_figure,
     export_unavailable,
@@ -63,7 +64,7 @@ def render(state: AppState) -> None:
     )
     st.dataframe(stats_table(compute_stats(period, state.selected_series)), hide_index=True)
 
-    _render_exports(fig, view)
+    _render_exports(state, fig, view)
 
 
 def _load(state: AppState, content: bytes, name: str) -> None:
@@ -179,8 +180,10 @@ def _render_controls(state: AppState) -> bool:
     return True
 
 
-def _render_exports(fig: go.Figure, view: pd.DataFrame) -> None:
+def _render_exports(state: AppState, fig: go.Figure, view: pd.DataFrame) -> None:
     st.subheader("Export")
+    if message := st.session_state.pop("export_message", None):
+        st.error(message)
     csv_col, png_col, pdf_col = st.columns(3)
     csv_col.download_button(
         "Download data (CSV)",
@@ -190,30 +193,43 @@ def _render_exports(fig: go.Figure, view: pd.DataFrame) -> None:
         width="stretch",
     )
     key = figure_key(fig)
+    busy = busy_message(state.export_owner)
     with png_col:
-        _render_image_export(fig, key, "png")
+        _render_image_export(state, fig, key, "png", busy)
     with pdf_col:
-        _render_image_export(fig, key, "pdf")
+        _render_image_export(state, fig, key, "pdf", busy)
     if export_unavailable():
         st.info(UNAVAILABLE_MESSAGE)
+    elif busy and (cached_image(key, "png") is None or cached_image(key, "pdf") is None):
+        note_col, check_col = st.columns([4, 1], vertical_alignment="center")
+        note_col.caption(busy)
+        check_col.button("Check again", key="export_check_again", width="stretch")
 
 
-def _render_image_export(fig: go.Figure, key: str, fmt: ImageFormat) -> None:
-    """Render the image only after an explicit click; afterwards offer the cached bytes."""
+def _render_image_export(
+    state: AppState, fig: go.Figure, key: str, fmt: ImageFormat, busy: str | None
+) -> None:
+    """Render the image only after an explicit click; afterwards offer the cached bytes.
+
+    The button is disabled while an earlier render of this session (or too many renders
+    overall) is still running, including one abandoned after a timeout.
+    """
     label = fmt.upper()
     data = cached_image(key, fmt)
     prepare = data is None and st.button(
         f"Prepare chart ({label})",
         key=f"prepare_{fmt}",
-        disabled=export_unavailable(),
+        disabled=export_unavailable() or busy is not None,
         width="stretch",
     )
     if prepare:
         with st.spinner(f"Rendering {label}..."):
             try:
-                data = export_figure(fig, fmt, key)
+                data = export_figure(fig, fmt, key, owner=state.export_owner)
             except ExportFailedError as exc:
-                st.error(str(exc))
+                # Rerun so both buttons reflect the new state; show the message after it.
+                st.session_state.export_message = str(exc)
+                st.rerun()
             except ExportError:
                 # Chrome is missing: rerun so both buttons are disabled and the message shown.
                 st.rerun()
