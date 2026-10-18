@@ -286,7 +286,13 @@ def run_export(params: ExportParams, state: AppState) -> ToolOutcome:
         return ToolOutcome(f"Prepared {_plural(len(view), 'row')} as CSV.", file=file)
 
     fmt = "png" if params.target == "chart_png" else "pdf"
-    fig = build_line_chart(view, state.dataset.date_col, state.selected_series, state.source_name)
+    fig = build_line_chart(
+        view,
+        state.dataset.date_col,
+        state.selected_series,
+        state.source_name,
+        secondary_axis=state.auto_secondary_axis,
+    )
     try:
         data = export_figure(fig, fmt)
     except ExportError as exc:

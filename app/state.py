@@ -26,6 +26,7 @@ class AppState:
     selected_series: list[str] = field(default_factory=list)
     date_range: tuple[date, date] | None = None
     aggregation: tuple[Period, Method] | None = None
+    auto_secondary_axis: bool = True
     numbers: list[int] | list[float] | None = None
     numbers_params: dict[str, Any] | None = None
     revision: int = 0

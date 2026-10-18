@@ -48,7 +48,13 @@ def render(state: AppState) -> None:
         st.warning("No data in the selected date range.")
         return
 
-    fig = build_line_chart(view, dataset.date_col, state.selected_series, state.source_name)
+    fig = build_line_chart(
+        view,
+        dataset.date_col,
+        state.selected_series,
+        state.source_name,
+        secondary_axis=state.auto_secondary_axis,
+    )
     st.plotly_chart(fig, width="stretch")
 
     st.subheader("Statistics for the selected period")
@@ -153,8 +159,18 @@ def _render_controls(state: AppState) -> bool:
     if isinstance(picked, tuple) and len(picked) == 2:
         state.date_range = None if picked == (first, last) else (picked[0], picked[1])
     state.aggregation = None if period is None else (period, method)
-    st.caption(
+    caption_col, axis_col = st.columns([4, 1], vertical_alignment="center")
+    caption_col.caption(
         f'"Last N days" in the chat is counted back from the latest date in the dataset ({last}).'
+    )
+    state.auto_secondary_axis = axis_col.toggle(
+        "Auto secondary axis",
+        value=state.auto_secondary_axis,
+        help=(
+            "Series more than 10x smaller than the largest one (by median absolute value) "
+            "are drawn on a right-hand axis."
+        ),
+        key="auto_secondary_axis",
     )
 
     if not series:
