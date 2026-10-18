@@ -18,8 +18,9 @@ Interactive time series charts, a random number generator and a chat assistant t
 - Upload a CSV or XLSX file, or load the bundled synthetic demo data (3 years of daily values).
 - Date and numeric columns are detected automatically and can be changed manually. CSV files may be UTF-8 (with or without BOM), cp1252 or latin-1, separated by commas, semicolons, tabs or pipes.
 - Interactive Plotly chart with multiple series, hover, zoom and a range slider; date range filter; daily, weekly or monthly aggregation (mean, sum, min, max).
+- Automatic secondary y-axis: a series more than 10× smaller than the largest one (by median absolute value of the plotted data) moves to a right-hand axis, marked "(right axis)" in the legend, so it does not sit flat at zero. It can be switched off with the **Auto secondary axis** toggle.
 - Statistics for the selected period: count, min, max, mean, first, last and % change.
-- Export the shown data as CSV and the chart as PNG or PDF. Images are rendered only on request and need Chrome or Chromium; without it, the rest of the app keeps working.
+- Export the shown data as CSV and the chart as PNG or PDF. Images are rendered only on request, one at a time per session, and need Chrome or Chromium; without it, the rest of the app keeps working.
 
 **Random number generator**
 - Up to 1,000,000 integers or floats (0–6 decimals) in an inclusive range.
@@ -129,7 +130,7 @@ ruff check .
 ruff format --check .
 ```
 
-The tests cover data loading (CSV encodings and separators, column detection, friendly errors), filtering, aggregation and statistics; the random number generator and its limits; tool parameter validation and execution; the offline parser's phrases; chat actions updating the shared app state; the Gemini provider, its schema conversion and the offline fallback; and image export caching, retries and timeouts, including Streamlit UI tests of the export buttons. They need no network, no API key and no Chrome: the Gemini client and image rendering are mocked. CI runs them on Python 3.11, 3.12, 3.13 and 3.14.
+The tests cover data loading (CSV encodings and separators, column detection, friendly errors), filtering, aggregation and statistics; the secondary-axis rule; the random number generator and its limits; tool parameter validation and execution; the offline parser's phrases; chat actions updating the shared app state; the Gemini provider, its schema conversion and the offline fallback; image export caching, retries, timeouts and render limits; and Streamlit UI tests of the export buttons and the Random tab form. They need no network, no API key and no Chrome: the Gemini client and image rendering are mocked. CI runs them on Python 3.11, 3.12, 3.13 and 3.14.
 
 To regenerate the demo data: `python scripts/make_demo_data.py`.
 
